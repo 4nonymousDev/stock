@@ -1,0 +1,8 @@
+{
+  "_comment": "复制本文件为 config.json 并填写同花顺账户。三项均留空则使用临时游客账户（仅供测试，可能随时失效）。也可用环境变量 THS_USERNAME / THS_PASSWORD / THS_MAC 覆盖文件配置。",
+  "account": {
+    "username": "",
+    "password": "",
+    "mac": ""
+  }
+}

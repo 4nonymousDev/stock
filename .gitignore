@@ -1,0 +1,7 @@
+# 账户配置（含凭证，请勿提交）
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
