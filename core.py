@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +28,33 @@ _KLINE_INTERVAL = 0.05
 # 计算拉升资金需 EMA89 预热，单只股票往前多取的自然日数（约 270 个交易日）
 _LIFT_LOOKBACK_DAYS = 400
 
+# ---------------------------------------------------------------------------
+# 5 日均线角度公式（实测反推问财，30 只跨价位样本 RMSE≈0.0004°，逐股吻合）：
+#   角度 = arctan(K * (MA5今 / MA5昨 - 1))      口径：前复权、涨幅归一
+#   即 tan(角度) = 5 日均线单日涨幅的百分数值；MA5 单日涨 1% ⟺ 恰好 45°
+# {T} 角度不走问财（问财用收盘价，含未来信息且非 9:26 状态），改由本引擎用
+# {T} 当日 9:26 价（= 开盘价，竞价 9:25 已定价）替换今日收盘价后按本公式计算。
+# {T1}/{T2}/{T3} 为已收盘交易日，其角度本公式与问财完全一致。
+# ---------------------------------------------------------------------------
+_ANGLE_MA = 5                 # 均线周期（固定 5 日）
+_ANGLE_K = 100.0              # 缩放系数（实测整数 100）
+_ANGLE_ADJUST = "forward"     # 角度口径：前复权（与问财一致）
+
+# 模板里的「{T}均线角度大于N」：阈值 N 直接从模板解析（模板=唯一事实来源），
+# 该子句送问财前会被剥离，改由引擎用 9:26 开盘价本地核验。改阈值只改模板即可。
+_T_ANGLE_RE = re.compile(r"\{T\}均线角度大于(\d+(?:\.\d+)?)")
+
+
+def _extract_t_angle_min(template: str) -> Optional[float]:
+    """从模板取 {T} 均线角度阈值；无该子句返回 None（即不做本地角度过滤）。"""
+    m = _T_ANGLE_RE.search(template)
+    return float(m.group(1)) if m else None
+
+
+def _strip_t_angle(template: str) -> str:
+    """剥离 {T}均线角度大于N 子句（含紧随的一个分隔符），其余原样送问财。"""
+    return re.sub(r"\{T\}均线角度大于\d+(?:\.\d+)?[，、。]?", "", template)
+
 # 问财返回的代码后缀 -> klines 所需的市场前缀
 _SUFFIX_TO_PREFIX = {
     "SH": "USHA",   # 上海 A 股
@@ -36,14 +65,20 @@ _SUFFIX_TO_PREFIX = {
 # ---------------------------------------------------------------------------
 # 策略模板：{T} 选股日，{T1}/{T2}/{T3} 为 T 往前推的第 1/2/3 个交易日
 # 日期占位符在运行时替换为 “YYYY年M月D日”。可由前端覆盖。
+#
+# 注意：模板里的「{T}均线角度大于N」是 9:26 决策条件，不能交给问财（问财用
+# {T} 收盘价，既含未来信息又非 9:26 状态）。引擎在送问财前自动剥离该子句，
+# 并解析出阈值 N，改用 {T} 开盘价本地核验（见 _run_day / _ma5_angle）。
+# 因此该子句可留在模板中作为唯一事实来源，改阈值只改模板即可。
+# {T1}/{T3} 角度仍由问财判定（已收盘、与本公式一致）。
 # ---------------------------------------------------------------------------
 DEFAULT_STRATEGY_TEMPLATE = (
     "剔除ST，只看主板和创业板，流通市值高于60亿且低于500亿，"
-    "{T1}均线角度大于60，{T}竞价异动，竞价金额大于1000万。"
-    "{T1}均线角度大于60，{T1}均线角度大于{T3}前均线角度，"
-    "{T}均线角度大于{T2}均线角度，归属于上市公司股东的净利润同期增长大于0%。"
+    "{T}竞价异动，竞价金额大于1000万。"
+    "{T}均线角度大于65，{T1}均线角度大于{T3}前均线角度，"
+    "归属于上市公司股东的净利润同期增长大于0%。"
     "机构数大于2家。{T}高开，{T}竞价涨幅小于4%。"
-    "{T}所属板块涨幅大于0.5%，{T}竞价急速上涨或竞价抢筹或大买单试盘或竞价砸盘。"
+    "{T}所属板块涨幅大于1%，{T}竞价急速上涨或竞价抢筹或大买单试盘或竞价砸盘。"
     "{T2}开盘价低于{T2}收盘价0.5%以上，{T1}开盘价低于{T1}收盘价0.5%以上"
 )
 
@@ -69,9 +104,13 @@ class StockForward:
     """单只选股及其选股日与后 3 个交易日表现。"""
     code: str
     name: str
-    base_price: Optional[float] = None        # 选股日(T)收盘价
+    base_price: Optional[float] = None        # 选股日(T)开盘价（=9:26 买入价=竞价价）
+    close_t: Optional[float] = None            # 选股日(T)收盘价（参考）
+    prev_close: Optional[float] = None         # 前一日(T-1)收盘价（昨收，竞价涨幅基准）
     forwards: list[dict[str, Any]] = field(default_factory=list)  # T+1/T+2/T+3
     lift: bool = False                         # 截至 T 是否连续 3 天拉升资金增加
+    angle_t: Optional[float] = None            # {T} 9:26 均线角度（开盘价自算）
+    angle_t2: Optional[float] = None           # {T2} 均线角度（收盘，对比基准）
 
 
 @dataclass
@@ -174,10 +213,11 @@ class BacktestEngine:
     def _stock_closes(self, kcode: str, t: dt.date,
                       fdays: list[Optional[dt.date]]
                       ) -> tuple[Optional[float], dict[dt.date, float], bool]:
-        """取该股票收盘价并判断拉升资金。
+        """取该股票行情并判断拉升资金（不复权，反映真实可成交价）。
 
         窗口从 T 往前 _LIFT_LOOKBACK_DAYS 自然日（供 EMA89 预热）到最后一个
-        前向交易日。返回 (T收盘价, {日期:收盘价}, 是否连续3天拉升资金增加)。
+        前向交易日。返回 (T开盘价, {日期:收盘价}, 是否连续3天拉升资金增加)。
+        T 开盘价即 9:26 买入价（竞价 9:25 已定价）。
         """
         valid = [d for d in fdays if d]
         last = max([t] + valid)
@@ -193,6 +233,7 @@ class BacktestEngine:
         if not k.success or not k.data:
             return None, closes, False
         rows: list[tuple[dt.date, float]] = []
+        open_t: Optional[float] = None
         for row in k.data:
             d = _to_date(row.get("时间"))
             c = row.get("收盘价")
@@ -204,10 +245,72 @@ class BacktestEngine:
                 continue
             closes[d] = cf
             rows.append((d, cf))
+            if d == t:
+                try:
+                    open_t = float(row.get("开盘价"))
+                except (TypeError, ValueError):
+                    open_t = None
         rows.sort()
         hist = [c for d, c in rows if d <= t]   # 截至 T（含）的收盘价序列
         lift = self._lift_increasing(hist)
-        return closes.get(t), closes, lift
+        return open_t, closes, lift
+
+    # ----- 5 日均线角度（本地自算，替代问财的 {T} 角度） ------------------
+    def _fwd_window(self, kcode: str, t: dt.date) -> dict[dt.date, tuple[float, float]]:
+        """取 t 前约 25 自然日到 t 的【前复权】日线 {日期:(开盘价, 收盘价)}。
+
+        覆盖 t 往前 ~17 个交易日，足够算 {T} 与 {T2} 的 5 日均线（各需前 5 日收盘）。
+        前复权口径与问财的均线角度一致。
+        """
+        first = t - dt.timedelta(days=25)
+        k = self._ths.klines(
+            kcode,
+            start_time=dt.datetime(first.year, first.month, first.day),
+            end_time=dt.datetime(t.year, t.month, t.day),
+            interval="day",
+            adjust=_ANGLE_ADJUST,
+        )
+        time.sleep(_KLINE_INTERVAL)
+        out: dict[dt.date, tuple[float, float]] = {}
+        if not k.success or not k.data:
+            return out
+        for row in k.data:
+            d = _to_date(row.get("时间"))
+            if d is None:
+                continue
+            try:
+                out[d] = (float(row.get("开盘价")), float(row.get("收盘价")))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _ma5_angle(prices: dict[dt.date, tuple[float, float]],
+                   calendar: list[dt.date], day: dt.date,
+                   use_open: bool) -> Optional[float]:
+        """按反推公式算 day 的 5 日均线角度（度）。
+
+        use_open=True 时用 day 的开盘价替换今日收盘价（{T} 的 9:26 口径）；
+        否则用收盘价（已收盘交易日，等同问财）。
+        角度 = arctan(K * (MA5今 / MA5昨 - 1))。
+        """
+        try:
+            idx = calendar.index(day)
+        except ValueError:
+            return None
+        if idx < _ANGLE_MA:                      # 需要 day 前 5 个交易日
+            return None
+        prev5 = [calendar[idx - i] for i in range(1, _ANGLE_MA + 1)]  # day-1..day-5
+        try:
+            closes_prev = [prices[d][1] for d in prev5]               # 收盘 day-1..day-5
+            today = prices[day][0] if use_open else prices[day][1]
+        except KeyError:
+            return None
+        ma_prev = sum(closes_prev) / _ANGLE_MA
+        ma_today = (sum(closes_prev[:-1]) + today) / _ANGLE_MA        # day-1..day-4 + 今日
+        if ma_prev == 0:
+            return None
+        return math.degrees(math.atan(_ANGLE_K * (ma_today / ma_prev - 1.0)))
 
     # ----- 选股 -----------------------------------------------------------
     def _select(self, query: str) -> tuple[list[dict], str]:
@@ -229,7 +332,8 @@ class BacktestEngine:
             day.error = "交易日历缺失"
             return day
         t1, t2, t3 = prev
-        query = template.format(
+        t_angle_min = _extract_t_angle_min(template)   # {T} 角度阈值（本地核验用）
+        query = _strip_t_angle(template).format(       # 送问财前剥离 {T} 角度子句
             T=_fmt_cn(t), T1=_fmt_cn(t1), T2=_fmt_cn(t2), T3=_fmt_cn(t3)
         )
         day.query = query
@@ -242,25 +346,39 @@ class BacktestEngine:
             wcode = s.get("股票代码") or s.get("THSCODE") or ""
             name = s.get("股票简称") or s.get("名称") or wcode
             kcode = convert_code(wcode)
-            sf = StockForward(code=wcode, name=name)
-            if kcode:
-                base, closes, lift = self._stock_closes(kcode, t, fdays)
-                sf.base_price = base
-                sf.lift = lift
-                for fd in fdays:
-                    entry: dict[str, Any] = {"date": fd.isoformat() if fd else None}
-                    if fd and base and fd in closes:
-                        price = closes[fd]
-                        pct = (price / base - 1.0) * 100.0
-                        entry["price"] = round(price, 2)
-                        entry["pct"] = round(pct, 2)
-                    else:
-                        entry["price"] = None
-                        entry["pct"] = None
-                    sf.forwards.append(entry)
-            else:
-                sf.forwards = [{"date": fd.isoformat() if fd else None,
-                                "price": None, "pct": None} for fd in fdays]
+            if not kcode:
+                continue                          # 无法定位 K 线则无法核验角度，剔除
+
+            # 本地核验 {T} 9:26 均线角度（开盘价口径）：角度 > 模板解析出的阈值。
+            prices = self._fwd_window(kcode, t)
+            angle_t = self._ma5_angle(prices, calendar, t, use_open=True)
+            if t_angle_min is not None:
+                if angle_t is None:
+                    continue                      # 有阈值却取不到角度，保守剔除
+                if not angle_t > t_angle_min:
+                    continue                      # 不满足 {T} 角度条件，剔除
+            # {T2} 角度仅作参考展示（当前模板未含 T-vs-T2 比较）
+            angle_t2 = self._ma5_angle(prices, calendar, t2, use_open=False)
+
+            sf = StockForward(
+                code=wcode, name=name, angle_t=round(angle_t, 2),
+                angle_t2=round(angle_t2, 2) if angle_t2 is not None else None)
+            base, closes, lift = self._stock_closes(kcode, t, fdays)  # base=T开盘价
+            sf.base_price = base
+            sf.close_t = closes.get(t)            # T 收盘价（参考）
+            sf.prev_close = closes.get(t1)        # T-1 收盘价（昨收）
+            sf.lift = lift
+            for fd in fdays:
+                entry: dict[str, Any] = {"date": fd.isoformat() if fd else None}
+                if fd and base and fd in closes:
+                    price = closes[fd]
+                    pct = (price / base - 1.0) * 100.0
+                    entry["price"] = round(price, 2)
+                    entry["pct"] = round(pct, 2)
+                else:
+                    entry["price"] = None
+                    entry["pct"] = None
+                sf.forwards.append(entry)
             day.stocks.append(sf)
         return day
 

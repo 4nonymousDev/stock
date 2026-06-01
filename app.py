@@ -56,8 +56,12 @@ def _day_to_row(day: DayResult) -> dict:
                 "code": s.code,
                 "name": s.name,
                 "base_price": s.base_price,
+                "close_t": s.close_t,
+                "prev_close": s.prev_close,
                 "forwards": s.forwards,
                 "lift": s.lift,
+                "angle_t": s.angle_t,
+                "angle_t2": s.angle_t2,
             }
             for s in day.stocks
         ],

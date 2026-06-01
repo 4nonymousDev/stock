@@ -106,7 +106,7 @@ function debugRow(day) {
   let raw;
   try { raw = esc(JSON.stringify(day.raw_response, null, 2)); }
   catch (e) { raw = esc(String(day.raw_response)); }
-  return `<tr class="debug-row"><td colspan="6">`
+  return `<tr class="debug-row"><td colspan="10">`
     + `<details><summary>🔍 ${day.date} · wencai 请求与返回（${n} 条）</summary>`
     + `<div class="dbg dbg-q"><b>请求语句：</b><pre>${q}</pre></div>`
     + `<div class="dbg"><b>原始返回：</b><pre>${raw}</pre></div>`
@@ -124,12 +124,35 @@ function cell(fwd) {
        + `<div class="sub">${fwd.date}</div>`;
 }
 
+// 价格 + 相对 base 的涨跌幅（同配色）。选股日收盘价用：开盘→收盘的波动。
+function pricePct(price, base) {
+  if (price == null) return '<span class="na">—</span>';
+  if (base == null || base === 0) return price.toFixed(2);
+  const pct = (price / base - 1) * 100;
+  const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
+  const sign = pct > 0 ? '+' : '';
+  return `<span class="${cls}">${price.toFixed(2)} / ${sign}${pct.toFixed(2)}%</span>`;
+}
+
+// 仅涨跌幅（同配色）。竞价涨幅 =（开盘价/前一日收盘价 - 1），开盘价即竞价价。
+function pctOnly(price, base) {
+  if (price == null || base == null || base === 0) return '<span class="na">—</span>';
+  const pct = (price / base - 1) * 100;
+  const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
+  const sign = pct > 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${pct.toFixed(2)}%</span>`;
+}
+
+function price2(v) {
+  return v != null ? v.toFixed(2) : '<span class="na">—</span>';
+}
+
 function dayRows(day) {
   const stocks = day.stocks || [];
   let html = '';
   if (!stocks.length) {
     const msg = day.error ? `<span class="empty">${day.error}</span>` : '<span class="empty">无选股</span>';
-    html += `<tr><td class="date">${day.date}</td><td colspan="5">${msg}</td></tr>`;
+    html += `<tr><td class="date">${day.date}</td><td colspan="9">${msg}</td></tr>`;
     return html + debugRow(day);
   }
   stocks.forEach((s, i) => {
@@ -137,7 +160,11 @@ function dayRows(day) {
     if (i === 0) html += `<td class="date" rowspan="${stocks.length}">${day.date}<div class="sub">${stocks.length} 只</div></td>`;
     const lift = s.lift ? ' <span class="badge-lift" title="连续3天拉升资金增加">主</span>' : '';
     html += `<td class="stock">${s.name}${lift} <span class="code">${s.code}</span></td>`;
-    html += `<td>${s.base_price != null ? s.base_price.toFixed(2) : '<span class="na">—</span>'}</td>`;
+    html += `<td>${s.angle_t != null ? s.angle_t.toFixed(2) + '°' : '<span class="na">—</span>'}${s.angle_t2 != null ? `<div class="sub">T2 ${s.angle_t2.toFixed(2)}°</div>` : ''}</td>`;
+    html += `<td>${price2(s.prev_close)}</td>`;
+    html += `<td>${price2(s.base_price)}</td>`;
+    html += `<td>${pctOnly(s.base_price, s.prev_close)}</td>`;
+    html += `<td>${pricePct(s.close_t, s.base_price)}</td>`;
     html += `<td>${cell(s.forwards[0])}</td>`;
     html += `<td>${cell(s.forwards[1])}</td>`;
     html += `<td>${cell(s.forwards[2])}</td>`;
@@ -147,7 +174,7 @@ function dayRows(day) {
 }
 
 const TABLE_HEAD = '<table><thead><tr>'
-  + '<th>日期</th><th>当日选股</th><th>选股日股价</th>'
+  + '<th>日期</th><th>当日选股</th><th>T均线角度(9:26)</th><th>前一日收盘价</th><th>选股日开盘价</th><th>竞价涨幅</th><th>选股日收盘价</th>'
   + '<th>后1个交易日</th><th>后2个交易日</th><th>后3个交易日</th>'
   + '</tr></thead><tbody id="tbody"></tbody></table>';
 
