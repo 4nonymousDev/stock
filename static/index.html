@@ -39,6 +39,16 @@
   .bar { height: 12px; background: #e6eaf0; border-radius: 6px; overflow: hidden; }
   .bar > i { display: block; height: 100%; width: 0; background: var(--head);
              border-radius: 6px; transition: width .25s ease; }
+  .api-status { margin-top: 8px; font-size: 13px; color: #555;
+                display: flex; align-items: center; gap: 7px; }
+  .api-status .dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb;
+                     flex: 0 0 auto; }
+  .api-status.idle    .dot { background: #bbb; }
+  .api-status.loading .dot { background: #f9a825; animation: pulse 1s ease-in-out infinite; }
+  .api-status.ok      .dot { background: #2e7d32; }
+  .api-status.err     .dot { background: #d32f2f; }
+  .api-status.err     { color: #d32f2f; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
   table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
   th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: center; }
   th { background: #f0f3f7; font-weight: 600; position: sticky; top: 0; }
@@ -98,6 +108,7 @@
   <div id="progress" class="progress">
     <div class="lbl"><span id="prog-text">准备中…</span></div>
     <div class="bar"><i id="prog-fill"></i></div>
+    <div id="api-status" class="api-status"><span class="dot"></span><span id="api-text">问财接口：空闲</span></div>
   </div>
   <div id="status"></div>
   <div id="result"></div>
@@ -282,6 +293,13 @@ function setProgress(done, total, label) {
   text.textContent = `${label} ${done}/${total}（${pct}%）`;
 }
 
+// 问财接口请求状态指示灯。state: idle | loading | ok | err
+function setApiStatus(state, text) {
+  const box = document.getElementById('api-status');
+  box.className = 'api-status ' + state;
+  document.getElementById('api-text').textContent = '问财接口：' + text;
+}
+
 async function runBacktest() {
   const btn = document.getElementById('run');
   const status = document.getElementById('status');
@@ -295,6 +313,7 @@ async function runBacktest() {
   status.textContent = '';
   result.innerHTML = '';
   setProgress(0, 0, '准备中…');
+  setApiStatus('loading', '连接中…');
 
   let total = 0, done = 0, stockCount = 0, tbody = null;
   try {
@@ -326,6 +345,15 @@ async function runBacktest() {
           result.innerHTML = total ? TABLE_HEAD : '<div class="panel empty">区间内无交易日</div>';
           tbody = document.getElementById('tbody');
           setProgress(0, total, '回测进度');
+          if (!total) setApiStatus('idle', '空闲');
+        } else if (ev.type === 'querying') {
+          setApiStatus('loading', `请求中 · 第 ${ev.index}/${ev.total} 天（${ev.date}）…`);
+        } else if (ev.type === 'queried') {
+          if (ev.error) {
+            setApiStatus('err', `第 ${ev.index}/${ev.total} 天（${ev.date}）失败：${ev.error}`);
+          } else {
+            setApiStatus('ok', `第 ${ev.index}/${ev.total} 天（${ev.date}）返回 ${ev.hits} 条，本地核验 ${ev.processing} 只…`);
+          }
         } else if (ev.type === 'day') {
           done = ev.index;
           const day = ev.row;
@@ -337,12 +365,14 @@ async function runBacktest() {
           throw new Error(ev.message || '回测失败');
         } else if (ev.type === 'done') {
           setProgress(ev.total, ev.total, '回测完成');
+          if (ev.total) setApiStatus('ok', `完成 · 共 ${ev.total} 个交易日`);
         }
       }
     }
     status.textContent = `完成：共 ${total} 个交易日，累计选股 ${stockCount} 只。`;
   } catch (e) {
     status.innerHTML = `<span style="color:var(--up)">出错：${e.message}</span>`;
+    setApiStatus('err', e.message);
   } finally {
     btn.disabled = false;
   }

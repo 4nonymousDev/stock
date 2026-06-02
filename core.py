@@ -414,14 +414,19 @@ class BacktestEngine:
         return True
 
     # ----- 单个交易日 -----------------------------------------------------
-    def _run_day(self, calendar: list[dt.date], t: dt.date,
-                 template: str) -> DayResult:
+    def _query_day(self, calendar: list[dt.date], t: dt.date, template: str):
+        """选股日的「问财阶段」：构造并发送问财请求、截断候选。
+
+        返回 (day, stocks_raw, checks, prevs, fdays)。day 已填好 query/raw_response/
+        error/notice；尚未做本地核验（交给 _process_candidates）。日历缺失时
+        stocks_raw 为空、prevs/fdays 为 None。
+        """
         day = DayResult(date=t.isoformat())
         try:
             prev = self._prev_trading_days(calendar, t, 3)  # [T1,T2,T3]
         except ValueError:
             day.error = "交易日历缺失"
-            return day
+            return day, [], _parse_local_checks(template), None, None
         t1, t2, t3 = prev
         checks = _parse_local_checks(template)          # 需本地核验的 {T} 子句
         query = _strip_local_clauses(template).format(  # 送问财前剥离本地子句
@@ -439,6 +444,15 @@ class BacktestEngine:
                           f"策略过宽会很慢，建议增加筛选条件收紧结果。")
             stocks_raw = stocks_raw[:_MAX_CANDIDATES_PER_DAY]
         fdays = self._next_trading_days(calendar, t, 3)  # [T+1,T+2,T+3]
+        return day, stocks_raw, checks, (t1, t2, t3), fdays
+
+    def _process_candidates(self, day: DayResult, stocks_raw: list[dict],
+                            calendar: list[dt.date], t: dt.date,
+                            prevs, fdays, checks: LocalChecks) -> None:
+        """选股日的「本地核验阶段」：逐只拉行情、9:26 本地核验、算后向收益。"""
+        if prevs is None:
+            return
+        t1, t2, t3 = prevs
         for s in stocks_raw:
             wcode = s.get("股票代码") or s.get("THSCODE") or ""
             name = s.get("股票简称") or s.get("名称") or wcode
@@ -476,16 +490,25 @@ class BacktestEngine:
                     entry["pct"] = None
                 sf.forwards.append(entry)
             day.stocks.append(sf)
+
+    def _run_day(self, calendar: list[dt.date], t: dt.date,
+                 template: str) -> DayResult:
+        """完整跑一个选股日（问财阶段 + 本地核验阶段），供非流式接口使用。"""
+        day, stocks_raw, checks, prevs, fdays = self._query_day(calendar, t, template)
+        self._process_candidates(day, stocks_raw, calendar, t, prevs, fdays, checks)
         return day
 
     # ----- 主流程 ---------------------------------------------------------
     def backtest_iter(self, start: dt.date, end: dt.date,
                       template: str = DEFAULT_STRATEGY_TEMPLATE):
-        """逐个交易日产出进度事件：
+        """逐个交易日产出进度事件，含问财接口请求状态：
 
         - {"type": "start", "total": N}
-        - {"type": "day", "index": i, "total": N, "day": DayResult}
-        - {"type": "done"}
+        - {"type": "querying", "index": i, "total": N, "date": ...}      问财请求中
+        - {"type": "queried", "index": i, "total": N, "date": ...,        问财已返回
+             "hits": 命中数, "processing": 待本地核验数, "error": ..., "notice": ...}
+        - {"type": "day", "index": i, "total": N, "day": DayResult}       本日完成
+        - {"type": "done", "total": N}
         """
         self.connect()
         with self._lock:
@@ -496,7 +519,16 @@ class BacktestEngine:
             total = len(sel_days)
             yield {"type": "start", "total": total}
             for i, t in enumerate(sel_days, 1):
-                day = self._run_day(calendar, t, template)
+                iso = t.isoformat()
+                yield {"type": "querying", "index": i, "total": total, "date": iso}
+                day, stocks_raw, checks, prevs, fdays = self._query_day(
+                    calendar, t, template)
+                hits = len(day.raw_response) if isinstance(day.raw_response, list) else 0
+                yield {"type": "queried", "index": i, "total": total, "date": iso,
+                       "hits": hits, "processing": len(stocks_raw),
+                       "error": day.error, "notice": day.notice}
+                self._process_candidates(day, stocks_raw, calendar, t, prevs,
+                                         fdays, checks)
                 yield {"type": "day", "index": i, "total": total, "day": day}
             yield {"type": "done", "total": total}
 
