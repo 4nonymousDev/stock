@@ -1,6 +1,9 @@
 # 账户配置（含凭证，请勿提交）
 config.json
 
+# 本地策略库（用户数据）
+strategies.db
+
 # Python
 __pycache__/
 *.py[cod]

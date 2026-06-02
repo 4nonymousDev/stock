@@ -22,6 +22,15 @@
   button { background: var(--head); color: #fff; border: none; padding: 9px 22px;
            border-radius: 6px; font-size: 14px; cursor: pointer; }
   button:disabled { background: #9bb8d6; cursor: not-allowed; }
+  select { padding: 7px 10px; border: 1px solid #ccc; border-radius: 6px;
+           font-size: 14px; background: #fff; min-width: 200px; }
+  .strat-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+               margin-bottom: 8px; }
+  .strat-bar label { margin: 0; }
+  .btn-sm { padding: 7px 12px; font-size: 13px; }
+  .btn-ghost { background: #fff; color: var(--head); border: 1px solid var(--head); }
+  .btn-danger { background: #fff; color: var(--up); border: 1px solid var(--up); }
+  .hint { font-size: 12px; color: #999; margin: 4px 0 0; }
   details { margin-top: 12px; }
   summary { cursor: pointer; color: var(--head); font-size: 13px; }
   #status { margin: 10px 0; font-size: 14px; color: #555; min-height: 20px; }
@@ -45,6 +54,8 @@
   .na { color: #bbb; }
   .empty { color: #999; font-style: italic; }
   .sub { color: #999; font-size: 11px; }
+  tr.notice-row td { background: #fff8e1; color: #8a6d00; text-align: left;
+                     padding: 6px 12px; font-size: 13px; }
   tr.debug-row td { background: #fafafa; text-align: left; padding: 6px 12px; }
   tr.debug-row summary { color: #777; font-size: 12px; }
   .dbg { margin: 8px 0; }
@@ -72,10 +83,16 @@
         <button id="run" onclick="runBacktest()">开始回测</button>
       </div>
     </div>
-    <details>
-      <summary>选股策略（可编辑；{T} 选股日，{T1}/{T2}/{T3} 为往前推的第 1/2/3 个交易日）</summary>
-      <textarea id="template" spellcheck="false"></textarea>
-    </details>
+    <div class="strat-bar" style="margin-top:14px;">
+      <label>选股策略</label>
+      <select id="strat-select" onchange="onSelectStrategy()"></select>
+      <button class="btn-sm btn-ghost" onclick="newStrategy()" title="新增策略">＋ 新增</button>
+      <button class="btn-sm" onclick="saveStrategy()" title="保存当前文本框内容">💾 保存</button>
+      <button class="btn-sm btn-danger" onclick="deleteStrategy()" title="删除当前策略">🗑 删除</button>
+    </div>
+    <textarea id="template" spellcheck="false"></textarea>
+    <p class="hint">真正发送的以上方文本框为准。占位符：{T} 选股日，{T1}/{T2}/{T3} 为往前推的第 1/2/3 个交易日；
+      支持本地子句 {T}均线角度大于N、{T}均线角度大于{T2}前均线角度、{T}6日均线大于中轨线（均用 9:26 开盘价本地核验）。</p>
   </div>
 
   <div id="progress" class="progress">
@@ -87,14 +104,86 @@
 </div>
 
 <script>
-async function loadTemplate() {
+// 策略库：名字 -> 模板。下拉选择后填入文本框，文本框是回测的唯一事实来源。
+let STRATEGIES = {};        // name -> template
+let DEFAULT_NAME = '默认策略';
+
+async function loadStrategies(selectName) {
   try {
-    const r = await fetch('/api/template');
+    const r = await fetch('/api/strategies');
     const j = await r.json();
-    document.getElementById('template').value = j.template;
-  } catch (e) { /* ignore */ }
+    DEFAULT_NAME = j.default_name || DEFAULT_NAME;
+    STRATEGIES = {};
+    const sel = document.getElementById('strat-select');
+    sel.innerHTML = '';
+    (j.strategies || []).forEach(s => {
+      STRATEGIES[s.name] = s.template;
+      const opt = document.createElement('option');
+      opt.value = s.name; opt.textContent = s.name;
+      sel.appendChild(opt);
+    });
+    // 选中目标策略（新建/保存后定位），否则保持首项
+    const names = Object.keys(STRATEGIES);
+    const pick = selectName && STRATEGIES[selectName] ? selectName : names[0];
+    if (pick) { sel.value = pick; document.getElementById('template').value = STRATEGIES[pick]; }
+  } catch (e) { /* 退化：仍可手动编辑文本框 */ }
 }
-loadTemplate();
+
+function onSelectStrategy() {
+  const name = document.getElementById('strat-select').value;
+  if (STRATEGIES[name] != null) document.getElementById('template').value = STRATEGIES[name];
+}
+
+async function postStrategy(name, template) {
+  const r = await fetch('/api/strategies', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, template}),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({detail: r.statusText}));
+    throw new Error(err.detail || '保存失败');
+  }
+}
+
+async function saveStrategy() {
+  const sel = document.getElementById('strat-select');
+  const cur = sel.value || '';
+  const name = (prompt('保存为策略名称：', cur) || '').trim();
+  if (!name) return;
+  if (STRATEGIES[name] != null && name !== cur &&
+      !confirm(`策略「${name}」已存在，覆盖它？`)) return;
+  try {
+    await postStrategy(name, document.getElementById('template').value);
+    await loadStrategies(name);
+  } catch (e) { alert(e.message); }
+}
+
+async function newStrategy() {
+  const name = (prompt('新策略名称（内容取当前文本框，可保存后再编辑）：', '') || '').trim();
+  if (!name) return;
+  if (STRATEGIES[name] != null) { alert(`策略「${name}」已存在`); return; }
+  try {
+    await postStrategy(name, document.getElementById('template').value);
+    await loadStrategies(name);
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteStrategy() {
+  const name = document.getElementById('strat-select').value;
+  if (!name) return;
+  if (name === DEFAULT_NAME) { alert('默认策略不可删除'); return; }
+  if (!confirm(`删除策略「${name}」？`)) return;
+  try {
+    const r = await fetch('/api/strategies/' + encodeURIComponent(name), {method: 'DELETE'});
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({detail: r.statusText}));
+      throw new Error(err.detail || '删除失败');
+    }
+    await loadStrategies();
+  } catch (e) { alert(e.message); }
+}
+
+loadStrategies();
 
 function esc(s) {
   return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -147,9 +236,14 @@ function price2(v) {
   return v != null ? v.toFixed(2) : '<span class="na">—</span>';
 }
 
+function noticeRow(day) {
+  if (!day.notice) return '';
+  return `<tr class="notice-row"><td colspan="10">⚠️ ${esc(day.notice)}</td></tr>`;
+}
+
 function dayRows(day) {
   const stocks = day.stocks || [];
-  let html = '';
+  let html = noticeRow(day);
   if (!stocks.length) {
     const msg = day.error ? `<span class="empty">${day.error}</span>` : '<span class="empty">无选股</span>';
     html += `<tr><td class="date">${day.date}</td><td colspan="9">${msg}</td></tr>`;

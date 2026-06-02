@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import strategies
 from config import load_account_ops
 from core import DEFAULT_STRATEGY_TEMPLATE, BacktestEngine, DayResult
 
@@ -27,6 +28,7 @@ STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="选股策略回测")
 engine = BacktestEngine(load_account_ops())
+strategies.init_db()
 
 
 @app.on_event("shutdown")
@@ -40,15 +42,47 @@ class BacktestRequest(BaseModel):
     template: str | None = None
 
 
+class StrategyRequest(BaseModel):
+    name: str
+    template: str
+
+
 @app.get("/api/template")
 def get_template() -> dict:
     return {"template": DEFAULT_STRATEGY_TEMPLATE}
+
+
+@app.get("/api/strategies")
+def list_strategies() -> dict:
+    """全部已保存策略 + 默认策略名（供前端下拉选择）。"""
+    return {"strategies": strategies.list_strategies(),
+            "default_name": strategies.DEFAULT_NAME}
+
+
+@app.post("/api/strategies")
+def save_strategy(req: StrategyRequest) -> dict:
+    """新增或更新策略（名字+模板的 k-v）。"""
+    try:
+        saved = strategies.save_strategy(req.name, req.template)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "strategy": saved}
+
+
+@app.delete("/api/strategies/{name}")
+def delete_strategy(name: str) -> dict:
+    try:
+        strategies.delete_strategy(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
 
 
 def _day_to_row(day: DayResult) -> dict:
     return {
         "date": day.date,
         "error": day.error,
+        "notice": day.notice,
         "query": day.query,
         "raw_response": day.raw_response,
         "stocks": [
