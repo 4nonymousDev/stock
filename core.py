@@ -40,25 +40,25 @@ _ANGLE_MA = 5                 # 均线周期（固定 5 日）
 _ANGLE_K = 100.0              # 缩放系数（实测整数 100）
 _ANGLE_ADJUST = "forward"     # 角度口径：前复权（与问财一致）
 
-# 6 日均线 vs 中轨线（通达信自定义指标，问财不认，必须本地核验）：
+# 5 日均线 vs 中轨线（通达信自定义指标，问财不认，必须本地核验）：
 #   压力线 = REF(HHV(H,N),1)   即 {T} 前 N 个交易日（不含当日）的最高价
 #   支撑线 = REF(LLV(L,N),1)   即 {T} 前 N 个交易日（不含当日）的最低价
 #   中轨线 = (压力线 + 支撑线) / 1.9        （除数实测为 1.9，非 2）
-#   条件   = MA(C,6) > 中轨线；{T} 的 MA6 用 9:26 开盘价替换今日收盘价。
+#   条件   = MA(C,5) > 中轨线；{T} 的 MA5 用 9:26 开盘价替换今日收盘价。
 _MIDLINE_N = 10               # 压力/支撑回看周期 N
 _MIDLINE_DIVISOR = 1.9        # 中轨线除数
-_MA_MID = 6                   # 中轨比较所用均线周期（6 日）
+_MA_MID = 5                   # 中轨比较所用均线周期（5 日）
 
 # {T} 的实时类子句必须本地核验（问财会用 {T} 收盘价，既含未来信息又非 9:26 状态），
 # 送问财前由 _strip_local_clauses 剥离，引擎用 9:26 开盘价本地核验：
 #   1) {T}均线角度大于N              —— 阈值型，要求 angle_t > N
 #   2) {T}均线角度大于{Tk}前均线角度   —— 比较型，要求 angle_t > 第 k 个交易日前角度
-#   3) {T}6日均线大于中轨线           —— 要求 MA6 > 中轨线
+#   3) {T}5日均线大于中轨线           —— 要求 MA5 > 中轨线
 # 末尾的 [，、。]? 连同子句后紧随的一个分隔符一并吃掉，避免剥离后残留空分隔。
 # {T1}/{T2}/{T3} 为已收盘交易日，其角度/均线与问财一致，相关子句仍交问财判定。
 _T_ANGLE_THRESH_RE = re.compile(r"\{T\}均线角度大于(\d+(?:\.\d+)?)[，、。]?")
 _T_ANGLE_CMP_RE = re.compile(r"\{T\}均线角度大于\{(T[123])\}前均线角度[，、。]?")
-_T_MIDLINE_RE = re.compile(r"\{T\}6日均线大于中轨线[，、。]?")
+_T_MIDLINE_RE = re.compile(r"\{T\}5日均线大于中轨线[，、。]?")
 
 
 @dataclass
@@ -66,7 +66,7 @@ class LocalChecks:
     """从模板解析出的、需用 9:26 价本地核验的 {T} 子句集合。"""
     angle_thresholds: list[float] = field(default_factory=list)   # angle_t > 各阈值
     angle_cmp_days: list[str] = field(default_factory=list)       # angle_t > angle(Tk)
-    need_midline: bool = False                                    # MA6 > 中轨线
+    need_midline: bool = False                                    # MA5 > 中轨线
 
 
 def _parse_local_checks(template: str) -> LocalChecks:
@@ -98,7 +98,7 @@ _SUFFIX_TO_PREFIX = {
 # 策略模板：{T} 选股日，{T1}/{T2}/{T3} 为 T 往前推的第 1/2/3 个交易日
 # 日期占位符在运行时替换为 “YYYY年M月D日”。可由前端覆盖、或从本地策略库选用。
 #
-# 注意：模板里的 {T} 实时子句（均线角度阈值/比较、6日均线大于中轨线）是 9:26
+# 注意：模板里的 {T} 实时子句（均线角度阈值/比较、5日均线大于中轨线）是 9:26
 # 决策条件，不能交给问财（问财用 {T} 收盘价，既含未来信息又非 9:26 状态）。
 # 引擎在送问财前自动剥离这些子句，改用 {T} 开盘价本地核验（见 _parse_local_checks /
 # _strip_local_clauses / _run_day / _ma5_angle / _midline_ok）。因此这些子句可留在
@@ -113,7 +113,7 @@ DEFAULT_STRATEGY_TEMPLATE = (
     "{T}集合竞价涨幅小于4%，机构数大于2家，{T}高开，"
     "{T1}均线角度大于70，{T}均线角度大于70，"
     "{T}均线角度大于{T2}前均线角度，{T}股价高于20日均线，"
-    "{T}6日均线大于中轨线"
+    "{T}5日均线大于中轨线"
 )
 
 
@@ -302,7 +302,7 @@ class BacktestEngine:
         """取 t 前约 40 自然日到 t 的【前复权】日线 {日期:(开,高,低,收)}。
 
         覆盖 t 往前 ~27 个交易日，足够算：5 日均线角度（前 5 日收盘）、
-        6 日均线（前 5 日收盘）、中轨线（前 N=10 日的最高/最低）。
+        5 日均线（前 4 日收盘 + 今日开盘）、中轨线（前 N=10 日的最高/最低）。
         前复权口径与问财的均线角度一致。
         """
         first = t - dt.timedelta(days=40)
@@ -359,29 +359,29 @@ class BacktestEngine:
     @staticmethod
     def _midline_ok(prices: dict[dt.date, tuple[float, float, float, float]],
                     calendar: list[dt.date], day: dt.date) -> Optional[bool]:
-        """day 的「6 日均线 > 中轨线」是否成立（{T} 的 MA6 用 9:26 开盘价）。
+        """day 的「5 日均线 > 中轨线」是否成立（{T} 的 MA5 用 9:26 开盘价）。
 
         压力线=前 N 日最高价, 支撑线=前 N 日最低价, 中轨=(压力+支撑)/1.9；
-        MA6 = day 前 5 日收盘 + 今日(开盘价)。数据不足/缺失返回 None（按不通过处理）。
+        MA5 = day 前 4 日收盘 + 今日(开盘价)。数据不足/缺失返回 None（按不通过处理）。
         """
         try:
             idx = calendar.index(day)
         except ValueError:
             return None
-        if idx < max(_MIDLINE_N, _MA_MID - 1):   # 需 day 前 N 日及前 5 日收盘
+        if idx < max(_MIDLINE_N, _MA_MID - 1):   # 需 day 前 N 日及前 4 日收盘
             return None
         prev_n = [calendar[idx - i] for i in range(1, _MIDLINE_N + 1)]   # day-1..day-N
-        prev5 = [calendar[idx - i] for i in range(1, _MA_MID)]          # day-1..day-5
+        prev_close = [calendar[idx - i] for i in range(1, _MA_MID)]     # day-1..day-(MA_MID-1)
         try:
             highs = [prices[d][1] for d in prev_n]
             lows = [prices[d][2] for d in prev_n]
-            closes5 = [prices[d][3] for d in prev5]
+            closes = [prices[d][3] for d in prev_close]
             today = prices[day][0]                                      # 9:26 开盘价
         except KeyError:
             return None
         midline = (max(highs) + min(lows)) / _MIDLINE_DIVISOR
-        ma6 = (sum(closes5) + today) / _MA_MID
-        return ma6 > midline
+        ma = (sum(closes) + today) / _MA_MID
+        return ma > midline
 
     # ----- 选股 -----------------------------------------------------------
     def _select(self, query: str) -> tuple[list[dict], str]:
