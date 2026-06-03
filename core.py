@@ -53,7 +53,7 @@ _ANGLE_ADJUST = "forward"     # 角度口径：前复权（与问财一致）
 #   条件   = MA(C,N) > 中轨线；{T} 的均线用 9:26 开盘价替换今日收盘价。
 _MIDLINE_N = 10               # 压力/支撑回看周期 N
 _MIDLINE_DIVISOR = 1.9        # 中轨线除数
-_MA_MID_OPTIONS = [5, 6, 10, 20]   # 中轨比较均线可选周期
+_MA_MID_DEFAULT = 5                # 中轨比较均线默认周期
 
 # ---------------------------------------------------------------------------
 # 本地指标注册表
@@ -76,8 +76,8 @@ LOCAL_INDICATORS: list[dict] = [
     {
         "type": "midline",
         "label": "{T} 均线大于中轨线",
-        "params": [{"name": "ma_period", "label": "均线周期（日）", "type": "select",
-                    "options": _MA_MID_OPTIONS, "default": 5}],
+        "params": [{"name": "ma_period", "label": "均线周期（日）", "type": "number",
+                    "default": _MA_MID_DEFAULT}],
         "enabled": True,
     },
 ]
