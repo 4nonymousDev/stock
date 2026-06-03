@@ -9,6 +9,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+
 import os
 import pathlib
 
@@ -19,11 +20,14 @@ from pydantic import BaseModel
 
 import strategies
 from config import load_account_ops
-from core import DEFAULT_STRATEGY_TEMPLATE, BacktestEngine, DayResult
+from core import (DEFAULT_STRATEGY_TEMPLATE, LOCAL_INDICATORS,
+                  BacktestEngine, DayResult, default_local_checks)
 
 _log_level = logging.DEBUG if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG" else logging.INFO
 logging.basicConfig(level=_log_level,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# basicConfig 在 uvicorn 已初始化日志后不会重新配置 handler，需显式覆盖级别
+logging.getLogger("backtest").setLevel(_log_level)
 logger = logging.getLogger("backtest.app")
 
 BASE_DIR = pathlib.Path(__file__).parent
@@ -43,19 +47,34 @@ app = FastAPI(title="选股策略回测", lifespan=_lifespan)
 
 
 class BacktestRequest(BaseModel):
-    start_date: str                       # YYYY-MM-DD
-    end_date: str                         # YYYY-MM-DD
-    template: str | None = None
+    start_date: str                        # YYYY-MM-DD
+    end_date: str                          # YYYY-MM-DD
+    wencai_clauses: str | None = None      # 发给问财的条件模板（含占位符）
+    local_checks: list[dict] | None = None # 本地指标列表，None 则取默认值
 
 
 class StrategyRequest(BaseModel):
     name: str
-    template: str
+    wencai_clauses: str
+    local_checks: list[dict] = []
+
+
+def _resolve(req: BacktestRequest) -> tuple[str, list[dict]]:
+    wencai = req.wencai_clauses or DEFAULT_STRATEGY_TEMPLATE
+    checks = req.local_checks if req.local_checks is not None else default_local_checks()
+    return wencai, checks
+
+
+@app.get("/api/local-indicators")
+def get_local_indicators() -> dict:
+    """返回所有已注册的本地指标定义（label、params），供前端动态渲染表单。"""
+    return {"indicators": LOCAL_INDICATORS}
 
 
 @app.get("/api/template")
 def get_template() -> dict:
-    return {"template": DEFAULT_STRATEGY_TEMPLATE}
+    return {"wencai_clauses": DEFAULT_STRATEGY_TEMPLATE,
+            "local_checks": default_local_checks()}
 
 
 @app.get("/api/strategies")
@@ -67,9 +86,10 @@ def list_strategies() -> dict:
 
 @app.post("/api/strategies")
 def save_strategy(req: StrategyRequest) -> dict:
-    """新增或更新策略（名字+模板的 k-v）。"""
+    """新增或更新策略。"""
     try:
-        saved = strategies.save_strategy(req.name, req.template)
+        saved = strategies.save_strategy(req.name, req.wencai_clauses,
+                                         json.dumps(req.local_checks, ensure_ascii=False))
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "strategy": saved}
@@ -122,9 +142,9 @@ def _parse_range(req: BacktestRequest) -> tuple[dt.date, dt.date]:
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest) -> dict:
     start, end = _parse_range(req)
-    template = req.template or DEFAULT_STRATEGY_TEMPLATE
+    wencai, checks = _resolve(req)
     try:
-        results = engine.backtest(start, end, template)
+        results = engine.backtest(start, end, wencai, checks)
     except Exception as e:  # noqa: BLE001
         logger.exception("回测失败")
         raise HTTPException(500, f"回测失败: {e}")
@@ -135,11 +155,11 @@ def run_backtest(req: BacktestRequest) -> dict:
 def run_backtest_stream(req: BacktestRequest) -> StreamingResponse:
     """流式回测：逐个交易日推送 NDJSON 进度事件，供前端进度条与增量渲染使用。"""
     start, end = _parse_range(req)
-    template = req.template or DEFAULT_STRATEGY_TEMPLATE
+    wencai, checks = _resolve(req)
 
     def gen():
         try:
-            for ev in engine.backtest_iter(start, end, template):
+            for ev in engine.backtest_iter(start, end, wencai, checks):
                 if ev["type"] == "day":
                     out = {"type": "day", "index": ev["index"],
                            "total": ev["total"], "row": _day_to_row(ev["day"])}

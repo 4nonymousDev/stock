@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import math
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -18,6 +18,10 @@ import pandas as pd
 from thsdk import THS
 
 logger = logging.getLogger("backtest.core")
+
+
+def _j(**kw) -> str:
+    return json.dumps(kw, ensure_ascii=False, default=str)
 
 # 上证指数，作为交易日历来源（指数不会停牌，比单只股票可靠）
 TRADING_CALENDAR_CODE = "USHI1A0001"
@@ -49,43 +53,47 @@ _MIDLINE_N = 10               # 压力/支撑回看周期 N
 _MIDLINE_DIVISOR = 1.9        # 中轨线除数
 _MA_MID = 5                   # 中轨比较所用均线周期（5 日）
 
-# {T} 的实时类子句必须本地核验（问财会用 {T} 收盘价，既含未来信息又非 9:26 状态），
-# 送问财前由 _strip_local_clauses 剥离，引擎用 9:26 开盘价本地核验：
-#   1) {T}均线角度大于N              —— 阈值型，要求 angle_t > N
-#   2) {T}均线角度大于{Tk}前均线角度   —— 比较型，要求 angle_t > 第 k 个交易日前角度
-#   3) {T}5日均线大于中轨线           —— 要求 MA5 > 中轨线
-# 末尾的 [，、。]? 连同子句后紧随的一个分隔符一并吃掉，避免剥离后残留空分隔。
-# {T1}/{T2}/{T3} 为已收盘交易日，其角度/均线与问财一致，相关子句仍交问财判定。
-_T_ANGLE_THRESH_RE = re.compile(r"\{T\}均线角度大于(\d+(?:\.\d+)?)[，、。]?")
-_T_ANGLE_CMP_RE = re.compile(r"\{T\}均线角度大于\{(T[123])\}前均线角度[，、。]?")
-_T_MIDLINE_RE = re.compile(r"\{T\}5日均线大于中轨线[，、。]?")
+# ---------------------------------------------------------------------------
+# 本地指标注册表
+# ---------------------------------------------------------------------------
+# 每条指标定义：
+#   type      唯一 key，前后端共用
+#   label     网页端显示的文字描述（只读，用户不可改）
+#   params    参数列表，每项 {name, label, type("number"|"select"), options?, default}
+#   enabled   默认是否启用
+#
+# 新增指标：在此列表追加一条，再在 BacktestEngine._pass_local_checks 里处理同名 type。
+# ---------------------------------------------------------------------------
+LOCAL_INDICATORS: list[dict] = [
+    {
+        "type": "angle_gt",
+        "label": "{T} 均线角度大于阈值",
+        "params": [{"name": "threshold", "label": "角度阈值（°）", "type": "number", "default": 70}],
+        "enabled": True,
+    },
+    {
+        "type": "midline",
+        "label": "{T} 5日均线大于中轨线",
+        "params": [],
+        "enabled": True,
+    },
+]
+
+# type -> 定义，供快速查找
+_INDICATOR_MAP: dict[str, dict] = {ind["type"]: ind for ind in LOCAL_INDICATORS}
 
 
-@dataclass
-class LocalChecks:
-    """从模板解析出的、需用 9:26 价本地核验的 {T} 子句集合。"""
-    angle_thresholds: list[float] = field(default_factory=list)   # angle_t > 各阈值
-    angle_cmp_days: list[str] = field(default_factory=list)       # angle_t > angle(Tk)
-    need_midline: bool = False                                    # MA5 > 中轨线
-
-
-def _parse_local_checks(template: str) -> LocalChecks:
-    """解析模板中所有需本地核验的 {T} 子句（不改原串）。"""
-    return LocalChecks(
-        angle_thresholds=[float(x) for x in _T_ANGLE_THRESH_RE.findall(template)],
-        angle_cmp_days=_T_ANGLE_CMP_RE.findall(template),
-        need_midline=bool(_T_MIDLINE_RE.search(template)),
-    )
-
-
-def _strip_local_clauses(template: str) -> str:
-    """剥离所有本地核验子句（含紧随的一个分隔符），其余原样送问财。"""
-    out = template
-    for rx in (_T_ANGLE_CMP_RE, _T_ANGLE_THRESH_RE, _T_MIDLINE_RE):
-        out = rx.sub("", out)
-    out = re.sub(r"[，、]{2,}", "，", out)    # 合并剥离后产生的连续分隔符
-    out = re.sub(r"[，、]+(?=。)", "", out)    # 句号前的悬挂分隔符
-    return out.strip("，、。 ")               # 去首尾悬挂分隔符
+def default_local_checks() -> list[dict]:
+    """返回所有默认启用的本地指标配置（含默认参数值）。"""
+    result = []
+    for ind in LOCAL_INDICATORS:
+        if not ind["enabled"]:
+            continue
+        item: dict = {"type": ind["type"]}
+        for p in ind["params"]:
+            item[p["name"]] = p["default"]
+        result.append(item)
+    return result
 
 # 问财返回的代码后缀 -> klines 所需的市场前缀
 _SUFFIX_TO_PREFIX = {
@@ -105,14 +113,20 @@ _SUFFIX_TO_PREFIX = {
 # 模板中作为唯一事实来源，改阈值/口径只改模板即可。
 # {T1}/{T2}/{T3} 角度仍由问财判定（已收盘、与本公式一致）。
 # ---------------------------------------------------------------------------
+# 发给问财的部分（不含本地核验子句）
 DEFAULT_STRATEGY_TEMPLATE = (
     "剔除ST，只看主板和创业板，流通市值高于60亿且低于600亿，"
     "{T}竞价急速上涨或竞价抢筹或大买单试盘或竞价砸盘，"
     "{T1}均线角度大于{T3}前均线角度，"
     "归属于上市公司股东的净利润同期增长大于0%，"
     "{T}集合竞价涨幅小于4%，机构数大于2家，{T}高开，"
-    "{T1}均线角度大于70，{T}均线角度大于70，"
-    "{T}均线角度大于{T2}前均线角度，{T}股价高于20日均线，"
+    "{T1}均线角度大于70，{T}股价高于20日均线，"
+    "{T}均线角度大于{T2}前均线角度"
+)
+
+# 本地核验部分（用 9:26 开盘价计算，不送问财）
+DEFAULT_LOCAL_CLAUSES = (
+    "{T}均线角度大于70，"
     "{T}5日均线大于中轨线"
 )
 
@@ -197,16 +211,17 @@ class BacktestEngine:
         # 往前留 ~15 个自然日以容纳 T-3，往后留 ~15 天容纳 T+3
         s = start - dt.timedelta(days=20)
         e = end + dt.timedelta(days=20)
-        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day)",
-                     TRADING_CALENDAR_CODE, s, e)
+        logger.debug(_j(api="klines", code=TRADING_CALENDAR_CODE,
+                        start=str(s), end=str(e), interval="day"))
         k = self._ths.klines(
             TRADING_CALENDAR_CODE,
             start_time=dt.datetime(s.year, s.month, s.day),
             end_time=dt.datetime(e.year, e.month, e.day),
             interval="day",
         )
-        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
-                     k.success, len(k.data) if k.data else 0, k.error or "")
+        logger.debug(_j(api="klines", code=TRADING_CALENDAR_CODE,
+                        success=k.success, rows=len(k.data) if k.data else 0,
+                        error=k.error or None, sample=k.data[0] if k.data else None))
         time.sleep(_KLINE_INTERVAL)
         if not k.success or not k.data:
             raise RuntimeError(f"获取交易日历失败: {k.error}")
@@ -267,16 +282,17 @@ class BacktestEngine:
         valid = [d for d in fdays if d]
         last = max([t] + valid)
         first = t - dt.timedelta(days=_LIFT_LOOKBACK_DAYS)
-        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day, adjust=none)",
-                     kcode, first, last)
+        logger.debug(_j(api="klines", code=kcode,
+                        start=str(first), end=str(last), interval="day"))
         k = self._ths.klines(
             kcode,
             start_time=dt.datetime(first.year, first.month, first.day),
             end_time=dt.datetime(last.year, last.month, last.day),
             interval="day",
         )
-        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
-                     k.success, len(k.data) if k.data else 0, k.error or "")
+        logger.debug(_j(api="klines", code=kcode,
+                        success=k.success, rows=len(k.data) if k.data else 0,
+                        error=k.error or None, sample=k.data[0] if k.data else None))
         time.sleep(_KLINE_INTERVAL)
         closes: dict[dt.date, float] = {}
         if not k.success or not k.data:
@@ -314,8 +330,8 @@ class BacktestEngine:
         前复权口径与问财的均线角度一致。
         """
         first = t - dt.timedelta(days=40)
-        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day, adjust=%s)",
-                     kcode, first, t, _ANGLE_ADJUST)
+        logger.debug(_j(api="klines", code=kcode,
+                        start=str(first), end=str(t), interval="day", adjust=_ANGLE_ADJUST))
         k = self._ths.klines(
             kcode,
             start_time=dt.datetime(first.year, first.month, first.day),
@@ -323,8 +339,9 @@ class BacktestEngine:
             interval="day",
             adjust=_ANGLE_ADJUST,
         )
-        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
-                     k.success, len(k.data) if k.data else 0, k.error or "")
+        logger.debug(_j(api="klines", code=kcode,
+                        success=k.success, rows=len(k.data) if k.data else 0,
+                        error=k.error or None, sample=k.data[0] if k.data else None))
         time.sleep(_KLINE_INTERVAL)
         out: dict[dt.date, tuple[float, float, float, float]] = {}
         if not k.success or not k.data:
@@ -397,55 +414,62 @@ class BacktestEngine:
 
     # ----- 选股 -----------------------------------------------------------
     def _select(self, query: str) -> tuple[list[dict], str]:
-        logger.debug("thsdk.wencai_nlp query=%r", query)
+        logger.debug(_j(api="wencai_nlp", query=query))
         resp = self._ths.wencai_nlp(query)
         data = resp.data
         if isinstance(data, dict):
             data = [data]
         hits = len(data) if data else 0
-        logger.debug("thsdk.wencai_nlp -> success=%s hits=%s error=%s",
-                     resp.success, hits, resp.error or "")
+        logger.debug(_j(api="wencai_nlp",
+                        success=resp.success, hits=hits, error=resp.error or None,
+                        sample=data[0] if data else None))
         if not resp.success:
             return [], resp.error
         return (data or []), ""
 
     def _pass_local_checks(self, prices, calendar: list[dt.date], t: dt.date,
                            prevs: tuple[dt.date, dt.date, dt.date],
-                           angle_t: Optional[float], checks: LocalChecks) -> bool:
-        """对单只股票核验模板中所有 {T} 本地子句，全部满足才返回 True。"""
+                           angle_t: Optional[float],
+                           checks: list[dict]) -> bool:
+        """对单只股票逐条核验本地指标，全部满足才返回 True。
+
+        checks 为结构化指标列表，每项 {"type": ..., 参数...}。
+        新增指标：在 LOCAL_INDICATORS 注册后，此处追加对应 type 的处理分支。
+        """
         ref = dict(zip(("T1", "T2", "T3"), prevs))
-        if checks.angle_thresholds or checks.angle_cmp_days:
-            if angle_t is None:
-                return False                      # 需要角度却取不到，保守剔除
-            for thr in checks.angle_thresholds:
-                if not angle_t > thr:
+        for chk in checks:
+            t_type = chk["type"]
+            if t_type == "angle_gt":
+                if angle_t is None or not angle_t > chk["threshold"]:
                     return False
-            for dname in checks.angle_cmp_days:
-                ref_angle = self._ma5_angle(prices, calendar, ref[dname], use_open=False)
+            elif t_type == "angle_gt_ref":
+                if angle_t is None:
+                    return False
+                ref_angle = self._ma5_angle(prices, calendar, ref[chk["ref"]], use_open=False)
                 if ref_angle is None or not angle_t > ref_angle:
                     return False
-        if checks.need_midline:
-            if self._midline_ok(prices, calendar, t) is not True:
-                return False
+            elif t_type == "midline":
+                if self._midline_ok(prices, calendar, t) is not True:
+                    return False
         return True
 
     # ----- 单个交易日 -----------------------------------------------------
-    def _query_day(self, calendar: list[dt.date], t: dt.date, template: str):
+    def _query_day(self, calendar: list[dt.date], t: dt.date,
+                   wencai_template: str, checks: list[dict]):
         """选股日的「问财阶段」：构造并发送问财请求、截断候选。
 
-        返回 (day, stocks_raw, checks, prevs, fdays)。day 已填好 query/raw_response/
-        error/notice；尚未做本地核验（交给 _process_candidates）。日历缺失时
-        stocks_raw 为空、prevs/fdays 为 None。
+        wencai_template 为含占位符的问财语句模板（不含本地指标）；
+        checks 为结构化本地指标列表，直接透传给 _process_candidates。
+        返回 (day, stocks_raw, checks, prevs, fdays)。
         """
         day = DayResult(date=t.isoformat())
         try:
             prev = self._prev_trading_days(calendar, t, 3)  # [T1,T2,T3]
         except ValueError:
             day.error = "交易日历缺失"
-            return day, [], _parse_local_checks(template), None, None
+            return day, [], checks, None, None
         t1, t2, t3 = prev
-        checks = _parse_local_checks(template)          # 需本地核验的 {T} 子句
-        query = _strip_local_clauses(template).format(  # 送问财前剥离本地子句
+        query = wencai_template.format(
             T=_fmt_cn(t), T1=_fmt_cn(t1), T2=_fmt_cn(t2), T3=_fmt_cn(t3)
         )
         day.query = query
@@ -454,7 +478,7 @@ class BacktestEngine:
         if err:
             day.error = err
         hits = len(stocks_raw)
-        if hits > _MAX_CANDIDATES_PER_DAY:               # 候选过多则截断，避免长时间无响应
+        if hits > _MAX_CANDIDATES_PER_DAY:
             day.notice = (f"问财命中 {hits} 只，超过单日处理上限 "
                           f"{_MAX_CANDIDATES_PER_DAY}，仅处理前 {_MAX_CANDIDATES_PER_DAY} 只。"
                           f"策略过宽会很慢，建议增加筛选条件收紧结果。")
@@ -464,7 +488,7 @@ class BacktestEngine:
 
     def _process_candidates(self, day: DayResult, stocks_raw: list[dict],
                             calendar: list[dt.date], t: dt.date,
-                            prevs, fdays, checks: LocalChecks) -> None:
+                            prevs, fdays, checks: list[dict]) -> None:
         """选股日的「本地核验阶段」：逐只拉行情、9:26 本地核验、算后向收益。"""
         if prevs is None:
             return
@@ -508,51 +532,54 @@ class BacktestEngine:
             day.stocks.append(sf)
 
     def _run_day(self, calendar: list[dt.date], t: dt.date,
-                 template: str) -> DayResult:
+                 wencai_template: str, checks: list[dict]) -> DayResult:
         """完整跑一个选股日（问财阶段 + 本地核验阶段），供非流式接口使用。"""
-        day, stocks_raw, checks, prevs, fdays = self._query_day(calendar, t, template)
+        day, stocks_raw, checks, prevs, fdays = self._query_day(
+            calendar, t, wencai_template, checks)
         self._process_candidates(day, stocks_raw, calendar, t, prevs, fdays, checks)
         return day
 
     # ----- 主流程 ---------------------------------------------------------
     def backtest_iter(self, start: dt.date, end: dt.date,
-                      template: str = DEFAULT_STRATEGY_TEMPLATE):
+                      wencai_template: str = DEFAULT_STRATEGY_TEMPLATE,
+                      checks: list[dict] | None = None):
         """逐个交易日产出进度事件，含问财接口请求状态：
 
         - {"type": "start", "total": N}
-        - {"type": "querying", "index": i, "total": N, "date": ...}      问财请求中
-        - {"type": "queried", "index": i, "total": N, "date": ...,        问财已返回
+        - {"type": "querying", "index": i, "total": N, "date": ...}
+        - {"type": "queried", "index": i, "total": N, "date": ...,
              "hits": 命中数, "processing": 待本地核验数, "error": ..., "notice": ...}
-        - {"type": "day", "index": i, "total": N, "day": DayResult}       本日完成
+        - {"type": "day", "index": i, "total": N, "day": DayResult}
         - {"type": "done", "total": N}
         """
+        if checks is None:
+            checks = default_local_checks()
         self.connect()
         with self._lock:
             calendar = self._load_calendar(start, end)
             self._calendar = calendar
-            # 选股日 = 区间内、且 T-3 有数据的交易日
             sel_days = [d for d in calendar if start <= d <= end]
             total = len(sel_days)
             yield {"type": "start", "total": total}
             for i, t in enumerate(sel_days, 1):
                 iso = t.isoformat()
                 yield {"type": "querying", "index": i, "total": total, "date": iso}
-                day, stocks_raw, checks, prevs, fdays = self._query_day(
-                    calendar, t, template)
+                day, stocks_raw, chks, prevs, fdays = self._query_day(
+                    calendar, t, wencai_template, checks)
                 hits = len(day.raw_response) if isinstance(day.raw_response, list) else 0
                 yield {"type": "queried", "index": i, "total": total, "date": iso,
                        "hits": hits, "processing": len(stocks_raw),
                        "error": day.error, "notice": day.notice}
-                self._process_candidates(day, stocks_raw, calendar, t, prevs,
-                                         fdays, checks)
+                self._process_candidates(day, stocks_raw, calendar, t, prevs, fdays, chks)
                 yield {"type": "day", "index": i, "total": total, "day": day}
             yield {"type": "done", "total": total}
 
     def backtest(self, start: dt.date, end: dt.date,
-                 template: str = DEFAULT_STRATEGY_TEMPLATE,
+                 wencai_template: str = DEFAULT_STRATEGY_TEMPLATE,
+                 checks: list[dict] | None = None,
                  progress=None) -> list[DayResult]:
         results: list[DayResult] = []
-        for ev in self.backtest_iter(start, end, template):
+        for ev in self.backtest_iter(start, end, wencai_template, checks):
             if ev["type"] == "day":
                 results.append(ev["day"])
                 if progress:

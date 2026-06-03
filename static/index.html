@@ -19,6 +19,26 @@
   input[type=date] { padding: 7px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
   textarea { width: 100%; min-height: 90px; padding: 10px; border: 1px solid #ccc;
              border-radius: 6px; font-size: 13px; line-height: 1.5; resize: vertical; }
+  .template-cols { display: flex; gap: 12px; margin-top: 10px; }
+  .template-col { flex: 1; min-width: 0; }
+  .template-col-hd { font-size: 12px; font-weight: 600; padding: 4px 10px;
+                     border-radius: 4px 4px 0 0; margin-bottom: -1px; }
+  .template-col-hd.wencai { background: #e8f0fe; color: #1a56db; border: 1px solid #c5d8fb; }
+  .template-col-hd.local  { background: #e6f4ea; color: #1e7e34; border: 1px solid #b7dfbe; }
+  .template-col textarea.wencai { border-top-left-radius: 0; border-color: #c5d8fb; }
+  .local-checks { border: 1px solid #b7dfbe; border-radius: 0 6px 6px 6px;
+                  padding: 8px 12px; background: #fff; }
+  .lc-row { display: flex; align-items: center; gap: 10px; padding: 5px 0;
+            border-bottom: 1px solid #f0f0f0; }
+  .lc-row:last-child { border-bottom: none; }
+  .lc-toggle { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
+  .lc-label { flex: 1; font-size: 13px; color: #333; }
+  .lc-label.disabled { color: #aaa; text-decoration: line-through; }
+  .lc-param { display: flex; align-items: center; gap: 4px; }
+  .lc-param label { font-size: 12px; color: #666; white-space: nowrap; }
+  .lc-param input[type=number] { width: 64px; padding: 3px 6px; border: 1px solid #ccc;
+                                  border-radius: 4px; font-size: 13px; }
+  .lc-param select { padding: 3px 6px; font-size: 13px; min-width: auto; }
   button { background: var(--head); color: #fff; border: none; padding: 9px 22px;
            border-radius: 6px; font-size: 14px; cursor: pointer; }
   button:disabled { background: #9bb8d6; cursor: not-allowed; }
@@ -68,7 +88,13 @@
                      padding: 6px 12px; font-size: 13px; }
   tr.debug-row td { background: #fafafa; text-align: left; padding: 6px 12px; }
   tr.debug-row summary { color: #777; font-size: 12px; }
-  .dbg { margin: 8px 0; }
+  .dbg-cols { display: flex; gap: 12px; }
+  .dbg-col { flex: 1; min-width: 0; }
+  .dbg-col-hd { font-size: 12px; font-weight: 600; color: #555; margin-bottom: 4px;
+                padding: 3px 8px; border-radius: 4px; }
+  .dbg-col-hd.wencai { background: #e8f0fe; color: #1a56db; }
+  .dbg-col-hd.local  { background: #e6f4ea; color: #1e7e34; }
+  .dbg { margin: 6px 0; }
   .dbg b { color: #555; font-size: 12px; }
   .dbg pre { margin: 4px 0 0; padding: 10px; background: #1e1e1e; color: #d4d4d4;
              border-radius: 6px; font-size: 12px; line-height: 1.5;
@@ -100,9 +126,17 @@
       <button class="btn-sm" onclick="saveStrategy()" title="保存当前文本框内容">💾 保存</button>
       <button class="btn-sm btn-danger" onclick="deleteStrategy()" title="删除当前策略">🗑 删除</button>
     </div>
-    <textarea id="template" spellcheck="false"></textarea>
-    <p class="hint">真正发送的以上方文本框为准。占位符：{T} 选股日，{T1}/{T2}/{T3} 为往前推的第 1/2/3 个交易日；
-      支持本地子句 {T}均线角度大于N、{T}均线角度大于{T2}前均线角度、{T}5日均线大于中轨线（均用 9:26 开盘价本地核验）。</p>
+    <div class="template-cols">
+      <div class="template-col">
+        <div class="template-col-hd wencai">📡 发送给问财的条件</div>
+        <textarea id="wencai-clauses" class="wencai" spellcheck="false"></textarea>
+      </div>
+      <div class="template-col">
+        <div class="template-col-hd local">🖥 本地核验条件（9:26 开盘价）</div>
+        <div class="local-checks" id="local-checks-form"></div>
+      </div>
+    </div>
+    <p class="hint">占位符：{T} 选股日，{T1}/{T2}/{T3} 为往前推的第 1/2/3 个交易日。勾选启用本地指标并填写参数值。</p>
   </div>
 
   <div id="progress" class="progress">
@@ -115,9 +149,99 @@
 </div>
 
 <script>
-// 策略库：名字 -> 模板。下拉选择后填入文本框，文本框是回测的唯一事实来源。
-let STRATEGIES = {};        // name -> template
+// ---- 本地指标表单 ----
+let INDICATORS = [];   // 从 /api/local-indicators 加载的指标定义
+let STRATEGIES = {};
 let DEFAULT_NAME = '默认策略';
+
+async function loadIndicators() {
+  const r = await fetch('/api/local-indicators');
+  const j = await r.json();
+  INDICATORS = j.indicators || [];
+}
+
+// 将指标定义 + 当前启用配置渲染为表单行
+function renderLocalChecks(checks) {
+  // checks: [{type, ...params}] 或 []，null 表示用默认值
+  const activeMap = {};
+  (checks || []).forEach(c => { activeMap[c.type] = c; });
+
+  const form = document.getElementById('local-checks-form');
+  form.innerHTML = '';
+  INDICATORS.forEach(ind => {
+    const active = activeMap[ind.type];
+    const enabled = !!active;
+    const row = document.createElement('div');
+    row.className = 'lc-row';
+    row.dataset.type = ind.type;
+
+    // 启用复选框
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'lc-toggle'; cb.checked = enabled;
+    cb.addEventListener('change', () => {
+      row.querySelectorAll('.lc-param input, .lc-param select').forEach(el => {
+        el.disabled = !cb.checked;
+      });
+      row.querySelector('.lc-label').classList.toggle('disabled', !cb.checked);
+    });
+
+    // 描述文字（只读）
+    const lbl = document.createElement('span');
+    lbl.className = 'lc-label' + (enabled ? '' : ' disabled');
+    lbl.textContent = ind.label;
+
+    row.appendChild(cb);
+    row.appendChild(lbl);
+
+    // 参数输入
+    ind.params.forEach(p => {
+      const wrap = document.createElement('div');
+      wrap.className = 'lc-param';
+      const plbl = document.createElement('label');
+      plbl.textContent = p.label + '：';
+      let el;
+      if (p.type === 'select') {
+        el = document.createElement('select');
+        p.options.forEach(opt => {
+          const o = document.createElement('option');
+          o.value = opt; o.textContent = opt; el.appendChild(o);
+        });
+        el.value = active ? active[p.name] : p.default;
+      } else {
+        el = document.createElement('input');
+        el.type = 'number'; el.step = 'any';
+        el.value = active ? active[p.name] : p.default;
+      }
+      el.dataset.param = p.name;
+      el.disabled = !enabled;
+      wrap.appendChild(plbl); wrap.appendChild(el);
+      row.appendChild(wrap);
+    });
+
+    form.appendChild(row);
+  });
+}
+
+// 从表单读出结构化 local_checks 列表
+function readLocalChecks() {
+  const checks = [];
+  document.querySelectorAll('#local-checks-form .lc-row').forEach(row => {
+    const cb = row.querySelector('.lc-toggle');
+    if (!cb.checked) return;
+    const item = {type: row.dataset.type};
+    row.querySelectorAll('[data-param]').forEach(el => {
+      const v = el.tagName === 'SELECT' ? el.value : parseFloat(el.value);
+      item[el.dataset.param] = v;
+    });
+    checks.push(item);
+  });
+  return checks;
+}
+
+function fillForm(s) {
+  document.getElementById('wencai-clauses').value = s ? (s.wencai_clauses || '') : '';
+  renderLocalChecks(s ? (s.local_checks || []) : null);
+}
 
 async function loadStrategies(selectName) {
   try {
@@ -128,27 +252,26 @@ async function loadStrategies(selectName) {
     const sel = document.getElementById('strat-select');
     sel.innerHTML = '';
     (j.strategies || []).forEach(s => {
-      STRATEGIES[s.name] = s.template;
+      STRATEGIES[s.name] = s;
       const opt = document.createElement('option');
       opt.value = s.name; opt.textContent = s.name;
       sel.appendChild(opt);
     });
-    // 选中目标策略（新建/保存后定位），否则保持首项
     const names = Object.keys(STRATEGIES);
     const pick = selectName && STRATEGIES[selectName] ? selectName : names[0];
-    if (pick) { sel.value = pick; document.getElementById('template').value = STRATEGIES[pick]; }
+    if (pick) { sel.value = pick; fillForm(STRATEGIES[pick]); }
   } catch (e) { /* 退化：仍可手动编辑文本框 */ }
 }
 
 function onSelectStrategy() {
   const name = document.getElementById('strat-select').value;
-  if (STRATEGIES[name] != null) document.getElementById('template').value = STRATEGIES[name];
+  if (STRATEGIES[name]) fillForm(STRATEGIES[name]);
 }
 
-async function postStrategy(name, template) {
+async function postStrategy(name, wencai_clauses, local_checks) {
   const r = await fetch('/api/strategies', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({name, template}),
+    body: JSON.stringify({name, wencai_clauses, local_checks}),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({detail: r.statusText}));
@@ -164,17 +287,21 @@ async function saveStrategy() {
   if (STRATEGIES[name] != null && name !== cur &&
       !confirm(`策略「${name}」已存在，覆盖它？`)) return;
   try {
-    await postStrategy(name, document.getElementById('template').value);
+    await postStrategy(name,
+      document.getElementById('wencai-clauses').value,
+      readLocalChecks());
     await loadStrategies(name);
   } catch (e) { alert(e.message); }
 }
 
 async function newStrategy() {
-  const name = (prompt('新策略名称（内容取当前文本框，可保存后再编辑）：', '') || '').trim();
+  const name = (prompt('新策略名称（内容取当前表单，可保存后再编辑）：', '') || '').trim();
   if (!name) return;
   if (STRATEGIES[name] != null) { alert(`策略「${name}」已存在`); return; }
   try {
-    await postStrategy(name, document.getElementById('template').value);
+    await postStrategy(name,
+      document.getElementById('wencai-clauses').value,
+      readLocalChecks());
     await loadStrategies(name);
   } catch (e) { alert(e.message); }
 }
@@ -194,7 +321,7 @@ async function deleteStrategy() {
   } catch (e) { alert(e.message); }
 }
 
-loadStrategies();
+loadIndicators().then(() => loadStrategies());
 
 function esc(s) {
   return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -206,10 +333,34 @@ function debugRow(day) {
   let raw;
   try { raw = esc(JSON.stringify(day.raw_response, null, 2)); }
   catch (e) { raw = esc(String(day.raw_response)); }
+
+  // 本地计算数据：从每只股票提取 angle_t / angle_t2 / lift / base_price
+  const stocks = day.stocks || [];
+  const localData = stocks.map(s => ({
+    code: s.code, name: s.name,
+    angle_t: s.angle_t, angle_t2: s.angle_t2,
+    lift: s.lift,
+    base_price: s.base_price,
+    close_t: s.close_t,
+    prev_close: s.prev_close,
+  }));
+  let localJson;
+  try { localJson = esc(JSON.stringify(localData, null, 2)); }
+  catch (e) { localJson = '{}'; }
+
   return `<tr class="debug-row"><td colspan="10">`
-    + `<details><summary>🔍 ${day.date} · wencai 请求与返回（${n} 条）</summary>`
+    + `<details><summary>🔍 ${day.date} · 问财数据（${n} 条）& 本地计算（${stocks.length} 只）</summary>`
+    + `<div class="dbg-cols">`
+    + `<div class="dbg-col">`
+    + `<div class="dbg-col-hd wencai">📡 发送给问财</div>`
     + `<div class="dbg dbg-q"><b>请求语句：</b><pre>${q}</pre></div>`
-    + `<div class="dbg"><b>原始返回：</b><pre>${raw}</pre></div>`
+    + `<div class="dbg"><b>原始返回（${n} 条）：</b><pre>${raw}</pre></div>`
+    + `</div>`
+    + `<div class="dbg-col">`
+    + `<div class="dbg-col-hd local">🖥 本地计算结果</div>`
+    + `<div class="dbg"><b>均线角度 / 拉升资金 / 价格（${stocks.length} 只）：</b><pre>${localJson}</pre></div>`
+    + `</div>`
+    + `</div>`
     + `</details></td></tr>`;
 }
 
@@ -307,7 +458,8 @@ async function runBacktest() {
   const body = {
     start_date: document.getElementById('start').value,
     end_date: document.getElementById('end').value,
-    template: document.getElementById('template').value,
+    wencai_clauses: document.getElementById('wencai-clauses').value,
+    local_checks: readLocalChecks(),
   };
   btn.disabled = true;
   status.textContent = '';
