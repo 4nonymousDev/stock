@@ -50,10 +50,10 @@ _ANGLE_ADJUST = "forward"     # 角度口径：前复权（与问财一致）
 #   压力线 = REF(HHV(H,N),1)   即 {T} 前 N 个交易日（不含当日）的最高价
 #   支撑线 = REF(LLV(L,N),1)   即 {T} 前 N 个交易日（不含当日）的最低价
 #   中轨线 = (压力线 + 支撑线) / 1.9        （除数实测为 1.9，非 2）
-#   条件   = MA(C,5) > 中轨线；{T} 的 MA5 用 9:26 开盘价替换今日收盘价。
+#   条件   = MA(C,N) > 中轨线；{T} 的均线用 9:26 开盘价替换今日收盘价。
 _MIDLINE_N = 10               # 压力/支撑回看周期 N
 _MIDLINE_DIVISOR = 1.9        # 中轨线除数
-_MA_MID = 5                   # 中轨比较所用均线周期（5 日）
+_MA_MID_OPTIONS = [5, 6, 10, 20]   # 中轨比较均线可选周期
 
 # ---------------------------------------------------------------------------
 # 本地指标注册表
@@ -75,8 +75,9 @@ LOCAL_INDICATORS: list[dict] = [
     },
     {
         "type": "midline",
-        "label": "{T} 5日均线大于中轨线",
-        "params": [],
+        "label": "{T} 均线大于中轨线",
+        "params": [{"name": "ma_period", "label": "均线周期（日）", "type": "select",
+                    "options": _MA_MID_OPTIONS, "default": 5}],
         "enabled": True,
     },
 ]
@@ -129,7 +130,7 @@ DEFAULT_STRATEGY_TEMPLATE = (
 # 本地核验部分（用 9:26 开盘价计算，不送问财）
 DEFAULT_LOCAL_CLAUSES = (
     "{T}均线角度大于70，"
-    "{T}5日均线大于中轨线"
+    "{T}均线大于中轨线"
 )
 
 
@@ -389,20 +390,21 @@ class BacktestEngine:
 
     @staticmethod
     def _midline_ok(prices: dict[dt.date, tuple[float, float, float, float]],
-                    calendar: list[dt.date], day: dt.date) -> Optional[bool]:
-        """day 的「5 日均线 > 中轨线」是否成立（{T} 的 MA5 用 9:26 开盘价）。
+                    calendar: list[dt.date], day: dt.date,
+                    ma_period: int = 5) -> Optional[bool]:
+        """day 的「ma_period 日均线 > 中轨线」是否成立（{T} 的均线用 9:26 开盘价）。
 
         压力线=前 N 日最高价, 支撑线=前 N 日最低价, 中轨=(压力+支撑)/1.9；
-        MA5 = day 前 4 日收盘 + 今日(开盘价)。数据不足/缺失返回 None（按不通过处理）。
+        MA = day 前 (ma_period-1) 日收盘 + 今日开盘价。数据不足/缺失返回 None（按不通过处理）。
         """
         try:
             idx = calendar.index(day)
         except ValueError:
             return None
-        if idx < max(_MIDLINE_N, _MA_MID - 1):   # 需 day 前 N 日及前 4 日收盘
+        if idx < max(_MIDLINE_N, ma_period - 1):
             return None
-        prev_n = [calendar[idx - i] for i in range(1, _MIDLINE_N + 1)]   # day-1..day-N
-        prev_close = [calendar[idx - i] for i in range(1, _MA_MID)]     # day-1..day-(MA_MID-1)
+        prev_n = [calendar[idx - i] for i in range(1, _MIDLINE_N + 1)]
+        prev_close = [calendar[idx - i] for i in range(1, ma_period)]
         try:
             highs = [prices[d][1] for d in prev_n]
             lows = [prices[d][2] for d in prev_n]
@@ -411,7 +413,7 @@ class BacktestEngine:
         except KeyError:
             return None
         midline = (max(highs) + min(lows)) / _MIDLINE_DIVISOR
-        ma = (sum(closes) + today) / _MA_MID
+        ma = (sum(closes) + today) / ma_period
         return ma > midline
 
     # ----- 选股 -----------------------------------------------------------
@@ -452,7 +454,8 @@ class BacktestEngine:
                 if ref_angle is None or not angle_t > ref_angle:
                     return False
             elif t_type == "midline":
-                if self._midline_ok(prices, calendar, t) is not True:
+                ma_period = int(chk.get("ma_period", 5))
+                if self._midline_ok(prices, calendar, t, ma_period) is not True:
                     return False
         return True
 
