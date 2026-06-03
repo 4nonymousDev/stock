@@ -28,6 +28,8 @@ TRADING_CALENDAR_CODE = "USHI1A0001"
 
 # klines 官方限频 20ms，留足余量
 _KLINE_INTERVAL = 0.05
+# wencai_nlp 官方限频 250ms/次，留足余量
+_WENCAI_INTERVAL = 0.26
 
 # 计算拉升资金需 EMA89 预热，单只股票往前多取的自然日数（约 270 个交易日）
 _LIFT_LOOKBACK_DAYS = 400
@@ -118,7 +120,7 @@ DEFAULT_STRATEGY_TEMPLATE = (
     "剔除ST，只看主板和创业板，流通市值高于60亿且低于600亿，"
     "{T}竞价急速上涨或竞价抢筹或大买单试盘或竞价砸盘，"
     "{T1}均线角度大于{T3}前均线角度，"
-    "归属于上市公司股东的净利润同期增长大于0%，"
+    "归属于上市公司股东的净利润同期增长大于1%，"
     "{T}集合竞价涨幅小于4%，机构数大于2家，{T}高开，"
     "{T1}均线角度大于70，{T}股价高于20日均线，"
     "{T}均线角度大于{T2}前均线角度"
@@ -416,6 +418,7 @@ class BacktestEngine:
     def _select(self, query: str) -> tuple[list[dict], str]:
         logger.debug(_j(api="wencai_nlp", query=query))
         resp = self._ths.wencai_nlp(query)
+        time.sleep(_WENCAI_INTERVAL)
         data = resp.data
         if isinstance(data, dict):
             data = [data]
