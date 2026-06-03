@@ -5,9 +5,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
+import os
 import pathlib
 
 from fastapi import FastAPI, HTTPException
@@ -19,21 +21,25 @@ import strategies
 from config import load_account_ops
 from core import DEFAULT_STRATEGY_TEMPLATE, BacktestEngine, DayResult
 
-logging.basicConfig(level=logging.INFO,
+_log_level = logging.DEBUG if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG" else logging.INFO
+logging.basicConfig(level=_log_level,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("backtest.app")
 
 BASE_DIR = pathlib.Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
 
-app = FastAPI(title="选股策略回测")
 engine = BacktestEngine(load_account_ops())
-strategies.init_db()
 
 
-@app.on_event("shutdown")
-def _shutdown() -> None:
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    strategies.init_db()
+    yield
     engine.close()
+
+
+app = FastAPI(title="选股策略回测", lifespan=_lifespan)
 
 
 class BacktestRequest(BaseModel):

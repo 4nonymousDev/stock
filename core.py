@@ -197,12 +197,16 @@ class BacktestEngine:
         # 往前留 ~15 个自然日以容纳 T-3，往后留 ~15 天容纳 T+3
         s = start - dt.timedelta(days=20)
         e = end + dt.timedelta(days=20)
+        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day)",
+                     TRADING_CALENDAR_CODE, s, e)
         k = self._ths.klines(
             TRADING_CALENDAR_CODE,
             start_time=dt.datetime(s.year, s.month, s.day),
             end_time=dt.datetime(e.year, e.month, e.day),
             interval="day",
         )
+        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
+                     k.success, len(k.data) if k.data else 0, k.error or "")
         time.sleep(_KLINE_INTERVAL)
         if not k.success or not k.data:
             raise RuntimeError(f"获取交易日历失败: {k.error}")
@@ -263,12 +267,16 @@ class BacktestEngine:
         valid = [d for d in fdays if d]
         last = max([t] + valid)
         first = t - dt.timedelta(days=_LIFT_LOOKBACK_DAYS)
+        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day, adjust=none)",
+                     kcode, first, last)
         k = self._ths.klines(
             kcode,
             start_time=dt.datetime(first.year, first.month, first.day),
             end_time=dt.datetime(last.year, last.month, last.day),
             interval="day",
         )
+        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
+                     k.success, len(k.data) if k.data else 0, k.error or "")
         time.sleep(_KLINE_INTERVAL)
         closes: dict[dt.date, float] = {}
         if not k.success or not k.data:
@@ -306,6 +314,8 @@ class BacktestEngine:
         前复权口径与问财的均线角度一致。
         """
         first = t - dt.timedelta(days=40)
+        logger.debug("thsdk.klines(%s, start=%s, end=%s, interval=day, adjust=%s)",
+                     kcode, first, t, _ANGLE_ADJUST)
         k = self._ths.klines(
             kcode,
             start_time=dt.datetime(first.year, first.month, first.day),
@@ -313,6 +323,8 @@ class BacktestEngine:
             interval="day",
             adjust=_ANGLE_ADJUST,
         )
+        logger.debug("thsdk.klines -> success=%s rows=%s error=%s",
+                     k.success, len(k.data) if k.data else 0, k.error or "")
         time.sleep(_KLINE_INTERVAL)
         out: dict[dt.date, tuple[float, float, float, float]] = {}
         if not k.success or not k.data:
@@ -385,12 +397,16 @@ class BacktestEngine:
 
     # ----- 选股 -----------------------------------------------------------
     def _select(self, query: str) -> tuple[list[dict], str]:
+        logger.debug("thsdk.wencai_nlp query=%r", query)
         resp = self._ths.wencai_nlp(query)
-        if not resp.success:
-            return [], resp.error
         data = resp.data
         if isinstance(data, dict):
             data = [data]
+        hits = len(data) if data else 0
+        logger.debug("thsdk.wencai_nlp -> success=%s hits=%s error=%s",
+                     resp.success, hits, resp.error or "")
+        if not resp.success:
+            return [], resp.error
         return (data or []), ""
 
     def _pass_local_checks(self, prices, calendar: list[dt.date], t: dt.date,
